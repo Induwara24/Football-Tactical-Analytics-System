@@ -1,0 +1,45 @@
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Model weights (exceed GitHub 100 MB limit)
+*.pt
+*.pth
+*.onnx
+*.engine
+models/*
+!models/.gitkeep
+
+# Videos & media outputs
+input_videos/*
+!input_videos/.gitkeep
+output_videos/*
+!output_videos/.gitkeep
+runs/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Cached inference stubs
+stubs/*
+!stubs/.gitkeep
+*.pkl
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
