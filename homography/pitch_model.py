@@ -17,16 +17,21 @@ ALL_PROJECTIVE_INTERSECTIONS = np.array(
     dtype=np.float64,
 )
 
-# Canonical non-collinear reference quad on the left penalty box for manifold-safe homography smoothing
-CANONICAL_PITCH_QUAD = np.array(
-    [
-        [0.0, 13.84],
-        [16.5, 13.84],
-        [0.0, 54.16],
-        [16.5, 54.16],
-    ],
-    dtype=np.float32,
-)
+
+def get_screen_ref_quad(width: int, height: int) -> np.ndarray:
+    """
+    View-agnostic 4-corner reference quad in image pixel coordinates.
+    Always lies strictly in front of the camera (z > 0) for Left, Midfield, and Right views.
+    """
+    return np.array(
+        [
+            [0.20 * width, 0.35 * height],
+            [0.80 * width, 0.35 * height],
+            [0.20 * width, 0.85 * height],
+            [0.80 * width, 0.85 * height],
+        ],
+        dtype=np.float32,
+    )
 
 
 def build_fifa_template_points() -> np.ndarray:
@@ -34,7 +39,7 @@ def build_fifa_template_points() -> np.ndarray:
     pts: list[list[float]] = []
 
     segments = [
-        # Outer touchlines & goal lines & halfway line
+        # Outer touchlines, goal lines & halfway line
         ((0.0, 0.0), (105.0, 0.0), 140),
         ((0.0, 68.0), (105.0, 68.0), 140),
         ((0.0, 0.0), (0.0, 68.0), 90),
@@ -62,7 +67,7 @@ def build_fifa_template_points() -> np.ndarray:
             pts.append([x1 + t * (x2 - x1), y1 + t * (y2 - y1)])
 
     # Center circle: center (52.5, 34.0), radius 9.15m
-    for ang in np.linspace(0.0, 2.0 * np.pi, 90, endpoint=False):
+    for ang in np.linspace(0.0, 2.0 * np.pi, 96, endpoint=False):
         pts.append([52.5 + 9.15 * np.cos(ang), 34.0 + 9.15 * np.sin(ang)])
 
     # Left penalty arc: center (11.0, 34.0), radius 9.15m, outside penalty area (X >= 16.5)
@@ -80,4 +85,3 @@ def build_fifa_template_points() -> np.ndarray:
             pts.append([px, py])
 
     return np.asarray(pts, dtype=np.float64)
-

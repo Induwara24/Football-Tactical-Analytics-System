@@ -67,3 +67,4 @@ The pipeline processes broadcast football footage (`1920x1080`, `25 FPS`) in `ma
    python main.py
    ```
    Cached `.pkl` stubs in `stubs/` allow re-running homography, team assignment, formation clustering, and rendering without repeating full YOLO inference.
+

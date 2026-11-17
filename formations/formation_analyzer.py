@@ -8,9 +8,9 @@ from sklearn.cluster import KMeans
 from threadpoolctl import threadpool_limits
 
 from homography.pitch_model import PITCH_LENGTH, PITCH_WIDTH
+from utils import FrameScaleContext
 
 
-# Canonical 10-outfield-player football formations
 FORMATIONS_3_LINE: list[tuple[int, int, int]] = [
     (4, 4, 2),
     (4, 3, 3),
@@ -28,18 +28,21 @@ FORMATIONS_4_LINE: list[tuple[int, int, int, int]] = [
 
 
 class FormationAnalyzer:
-    """Dual Spatial K-Means formation classifier for both On-Ball (Attacking) and Off-Ball (Defending) teams."""
+    """
+    Resolution- and FPS-adaptive Dual Spatial K-Means formation classifier
+    for both On-Ball (Attacking) and Off-Ball (Defending) teams.
+    """
 
     def __init__(
         self,
-        coord_smooth_window: int = 35,
-        ghost_ttl_frames: int = 50,
-        formation_smooth_window: int = 35,
-        min_4line_band_gap_m: float = 5.2,
+        coord_smooth_seconds: float = 1.40,
+        ghost_ttl_seconds: float = 2.00,
+        formation_smooth_seconds: float = 1.40,
+        min_4line_band_gap_m: float = 3.9,
     ) -> None:
-        self.coord_smooth_window = coord_smooth_window
-        self.ghost_ttl_frames = ghost_ttl_frames
-        self.formation_smooth_window = formation_smooth_window
+        self.coord_smooth_seconds = coord_smooth_seconds
+        self.ghost_ttl_seconds = ghost_ttl_seconds
+        self.formation_smooth_seconds = formation_smooth_seconds
         self.min_4line_band_gap_m = min_4line_band_gap_m
 
     @staticmethod
@@ -48,7 +51,6 @@ class FormationAnalyzer:
         y_m: float,
         defends_left: bool,
     ) -> tuple[float, float]:
-        """Map pitch (X_m, Y_m) to team-centric (u_depth, v_width) where u=0 is own goal and u=105 is opponent goal."""
         if defends_left:
             return float(x_m), float(y_m)
         return float(PITCH_LENGTH - x_m), float(PITCH_WIDTH - y_m)
@@ -57,10 +59,10 @@ class FormationAnalyzer:
     def _camera_fov_depth_span(
         H_img_to_pitch: np.ndarray,
         defends_left: bool,
-        frame_w: int = 1920,
-        frame_h: int = 1080,
+        frame_w: int,
+        frame_h: int,
     ) -> tuple[float, float]:
-        """Compute the visible [u_min, u_max] tactical depth range covered by the broadcast camera at frame t."""
+        """Compute the visible [u_min, u_max] tactical depth range covered by the broadcast camera."""
         top_y = 0.18 * frame_h
         sample_img = np.array(
             [
@@ -81,10 +83,46 @@ class FormationAnalyzer:
         us = xs if defends_left else (PITCH_LENGTH - xs)
         return float(np.min(us)), float(np.max(us))
 
+    @staticmethod
+    def _infer_defended_goals(tracks: dict, default_map: dict[int, bool]) -> dict[int, bool]:
+        """Verify defended goal sides from goalkeeper X_m and outfield X_m medians."""
+        gk_x: dict[int, list[float]] = {1: [], 2: []}
+        out_x: dict[int, list[float]] = {1: [], 2: []}
+        for frame_p in tracks.get("players", []):
+            for pdata in frame_p.values():
+                if not pdata.get("on_pitch", True):
+                    continue
+                pt = pdata.get("position_transformed")
+                tid_team = pdata.get("team_id")
+                if pt is None or tid_team not in (1, 2):
+                    continue
+                if pdata.get("role") == "goalkeeper":
+                    gk_x[tid_team].append(float(pt[0]))
+                else:
+                    out_x[tid_team].append(float(pt[0]))
+
+        # Check goalkeeper anchors near X=0 or X=105 first
+        for t_id in (1, 2):
+            if len(gk_x[t_id]) >= 5:
+                med_gk = float(np.median(gk_x[t_id]))
+                other = 2 if t_id == 1 else 1
+                if med_gk < 22.0:
+                    return {t_id: True, other: False}
+                if med_gk > PITCH_LENGTH - 22.0:
+                    return {t_id: False, other: True}
+
+        if out_x[1] and out_x[2]:
+            t1_left = float(np.median(out_x[1])) <= float(np.median(out_x[2]))
+            return {1: t1_left, 2: not t1_left}
+
+        return dict(default_map)
+
     def _build_smoothed_team_trajectories(
         self,
         tracks: dict,
         team_defends_left: dict[int, bool],
+        coord_smooth_win: int,
+        split_gap_frames: int,
     ) -> dict[int, dict[int, dict[int, tuple[float, float]]]]:
         """Smooth each on-pitch outfield player's (u_depth, v_width) within contiguous same-team segments."""
         num_frames = len(tracks.get("players", []))
@@ -104,16 +142,15 @@ class FormationAnalyzer:
                 u, v = self._normalize_tactical_coords(pt[0], pt[1], team_defends_left.get(team_id, True))
                 raw_series[team_id][tid].append((f, u, v))
 
-        half = self.coord_smooth_window // 2
-        sigma = max(1.0, self.coord_smooth_window / 4.0)
+        half = coord_smooth_win // 2
+        sigma = max(1.0, coord_smooth_win / 4.0)
         smoothed: dict[int, dict[int, dict[int, tuple[float, float]]]] = {1: {}, 2: {}}
 
         for team_id in (1, 2):
             for tid, obs in raw_series[team_id].items():
-                # Split into contiguous segments if gap > 10 frames (prevents smoothing across ID swaps)
                 segments: list[list[tuple[int, float, float]]] = []
                 for item in obs:
-                    if not segments or (item[0] - segments[-1][-1][0]) > 10:
+                    if not segments or (item[0] - segments[-1][-1][0]) > split_gap_frames:
                         segments.append([item])
                     else:
                         segments[-1].append(item)
@@ -139,7 +176,6 @@ class FormationAnalyzer:
         u_min_fov: float,
         u_max_fov: float,
     ) -> list[int]:
-        """Adjust visible outfield line counts to sum to 10 using camera frustum clipping priors."""
         adj = list(counts)
         total = sum(adj)
         if total == 10:
@@ -177,7 +213,6 @@ class FormationAnalyzer:
 
     @staticmethod
     def _match_canonical_3line(counts_3: list[int], phase: str) -> tuple[int, int, int]:
-        """Match 3-band counts to the nearest canonical 10-man (DEF, MID, FWD) formation."""
         cum_obs = np.array([counts_3[0], counts_3[0] + counts_3[1]], dtype=np.float64)
         best_tmpl = FORMATIONS_3_LINE[0]
         best_cost = 1e9
@@ -205,10 +240,6 @@ class FormationAnalyzer:
         u_max_fov: float,
         phase: str,
     ) -> tuple[str, dict[int, tuple[str, int]], list[int]]:
-        """
-        Run spatial K-Means on active outfield players [(tid, u_depth, v_width, is_visible)]
-        and classify into 3-line or 4-line (4-2-3-1 / 4-1-4-1) formation.
-        """
         n_active = len(active_players)
         if n_active < 4:
             default_fmt = "4-3-3" if phase == "ATTACKING" else "4-4-2"
@@ -217,7 +248,6 @@ class FormationAnalyzer:
         X_spatial = np.array([[p[1], 0.12 * p[2]] for p in active_players], dtype=np.float64)
         u_vals = X_spatial[:, 0]
 
-        # 1. Standard 3-Line KMeans (DEF, MID, FWD)
         km3 = KMeans(n_clusters=3, n_init=4, max_iter=50, random_state=42)
         raw_lbl3 = km3.fit_predict(X_spatial)
         order3 = np.argsort(km3.cluster_centers_[:, 0])
@@ -228,7 +258,6 @@ class FormationAnalyzer:
         adj_counts3 = self._compensate_counts_to_10(raw_counts3, u_min_fov, u_max_fov)
         best_3 = self._match_canonical_3line(adj_counts3, phase)
 
-        # 2. Evaluate 4-Line split (4-2-3-1 / 4-1-4-1) when midfield/forward depth bands separate cleanly
         use_4_line = False
         chosen_4: tuple[int, int, int, int] | None = None
         sorted_lbl4: np.ndarray | None = None
@@ -245,7 +274,7 @@ class FormationAnalyzer:
             dm_std = float(np.std(u_vals[cand_lbl4 == 1])) if np.sum(cand_lbl4 == 1) > 1 else 0.0
             am_std = float(np.std(u_vals[cand_lbl4 == 2])) if np.sum(cand_lbl4 == 2) > 1 else 0.0
 
-            if float(np.min(band_gaps)) >= self.min_4line_band_gap_m and dm_std <= 3.4 and am_std <= 3.4:
+            if float(np.min(band_gaps)) >= self.min_4line_band_gap_m and dm_std <= 4.2 and am_std <= 4.2:
                 raw_counts4 = [int(np.sum(cand_lbl4 == r)) for r in range(4)]
                 adj_counts4 = self._compensate_counts_to_10(raw_counts4, u_min_fov, u_max_fov)
                 cum4_obs = np.cumsum(adj_counts4)[:-1]
@@ -286,7 +315,6 @@ class FormationAnalyzer:
 
     @staticmethod
     def _smooth_formation_strings(raw_formations: list[str], window: int) -> list[str]:
-        """Apply centered majority-vote mode smoothing on formation labels to eliminate frame jitter."""
         n = len(raw_formations)
         if n == 0:
             return []
@@ -304,22 +332,26 @@ class FormationAnalyzer:
     def analyze_formations(
         self,
         tracks: dict,
-        homographies: list[dict[str, np.ndarray]],
+        homographies: list[dict[str, Any]],
         possession_states: list[dict[str, Any]],
         team_defends_left: dict[int, bool],
+        scale_ctx: FrameScaleContext | None = None,
         read_from_stub: bool = True,
         stub_path: str = "stubs/formations_stub.pkl",
     ) -> list[dict[str, Any]]:
-        """
-        Compute per-frame formations for BOTH the On-Ball (Attacking) and Off-Ball (Defending) teams,
-        annotate per-player tactical lines on `tracks`, and cache results to `stubs/formations_stub.pkl`.
-        """
+        """Compute per-frame formations for BOTH the On-Ball (Attacking) and Off-Ball (Defending) teams."""
         num_frames = min(len(tracks.get("players", [])), len(homographies), len(possession_states))
+        fw = scale_ctx.frame_w if scale_ctx is not None else 1920
+        fh = scale_ctx.frame_h if scale_ctx is not None else 1080
+        coord_win = scale_ctx.frames_for_seconds(self.coord_smooth_seconds, minimum=9) if scale_ctx else 35
+        ghost_ttl = scale_ctx.frames_for_seconds(self.ghost_ttl_seconds, minimum=12) if scale_ctx else 50
+        fmt_win = scale_ctx.frames_for_seconds(self.formation_smooth_seconds, minimum=9) if scale_ctx else 35
+        split_gap = scale_ctx.frames_for_seconds(0.40, minimum=6) if scale_ctx else 10
 
         if read_from_stub and stub_path and os.path.exists(stub_path):
             with open(stub_path, "rb") as f:
                 cached = pickle.load(f)
-            if isinstance(cached, dict) and cached.get("version") == 2 and len(cached.get("frame_formations", [])) == num_frames:
+            if isinstance(cached, dict) and cached.get("version") == 3 and len(cached.get("frame_formations", [])) == num_frames:
                 per_frame_lines = cached.get("per_frame_player_lines", [])
                 for f_idx in range(num_frames):
                     line_map = per_frame_lines[f_idx] if f_idx < len(per_frame_lines) else {}
@@ -331,7 +363,8 @@ class FormationAnalyzer:
                             pdata["tactical_line"], pdata["tactical_band_idx"] = line_map[tid]
                 return cached["frame_formations"]
 
-        smoothed_trajs = self._build_smoothed_team_trajectories(tracks, team_defends_left)
+        resolved_defends_left = self._infer_defended_goals(tracks, team_defends_left)
+        smoothed_trajs = self._build_smoothed_team_trajectories(tracks, resolved_defends_left, coord_win, split_gap)
 
         last_seen: dict[int, dict[int, tuple[int, float, float]]] = {1: {}, 2: {}}
         raw_team_fmt: dict[int, list[str]] = {1: [], 2: []}
@@ -346,7 +379,6 @@ class FormationAnalyzer:
                 on_ball_team = poss["on_ball_team"]
                 frame_line_map: dict[int, tuple[str, int]] = {}
 
-                # Evict any ghost IDs that are currently visible on the opposite team (due to ByteTrack ID swap)
                 for tid, pdata in tracks["players"][f].items():
                     t_curr = pdata.get("team_id")
                     if t_curr in (1, 2):
@@ -354,8 +386,8 @@ class FormationAnalyzer:
                         last_seen[other_t].pop(tid, None)
 
                 for team_id in (1, 2):
-                    defends_left = team_defends_left.get(team_id, team_id == 1)
-                    u_min_fov, u_max_fov = self._camera_fov_depth_span(H_i2p, defends_left)
+                    defends_left = resolved_defends_left.get(team_id, team_id == 1)
+                    u_min_fov, u_max_fov = self._camera_fov_depth_span(H_i2p, defends_left, fw, fh)
                     phase = "ATTACKING" if team_id == on_ball_team else "DEFENDING"
 
                     vis_tids: list[int] = []
@@ -383,7 +415,7 @@ class FormationAnalyzer:
                             if g_tid in vis_tids:
                                 continue
                             age = f - last_f
-                            if age <= self.ghost_ttl_frames:
+                            if age <= ghost_ttl:
                                 min_d = min(
                                     (np.hypot(gu - vu, gv - vv) for (_, vu, vv, _) in active_list),
                                     default=99.0,
@@ -414,8 +446,8 @@ class FormationAnalyzer:
 
                 per_frame_player_lines.append(frame_line_map)
 
-        sm_fmt_1 = self._smooth_formation_strings(raw_team_fmt[1], self.formation_smooth_window)
-        sm_fmt_2 = self._smooth_formation_strings(raw_team_fmt[2], self.formation_smooth_window)
+        sm_fmt_1 = self._smooth_formation_strings(raw_team_fmt[1], fmt_win)
+        sm_fmt_2 = self._smooth_formation_strings(raw_team_fmt[2], fmt_win)
 
         frame_formations: list[dict[str, Any]] = []
         for f in range(num_frames):
@@ -456,7 +488,7 @@ class FormationAnalyzer:
             with open(stub_path, "wb") as f:
                 pickle.dump(
                     {
-                        "version": 2,
+                        "version": 3,
                         "frame_formations": frame_formations,
                         "per_frame_player_lines": per_frame_player_lines,
                     },
